@@ -9,6 +9,7 @@ import Unison.Hash.Extra ()
 import Unison.Node.Store (Store)
 import Unison.Var (Var)
 import qualified Unison.ABT as ABT
+import qualified Unison.Builtin.Store as Store
 import qualified Unison.Node.BasicNode as BasicNode
 import qualified Unison.Node.Builtin as Builtin
 #ifdef leveldb
@@ -36,5 +37,7 @@ store = FileStore.make "store"
 main :: IO ()
 main = do
   store' <- store
-  node <- BasicNode.make hash store' Builtin.makeBuiltins
+  keyValueOps <- Store.makeAPI
+  let makeBuiltins whnf = concat [Builtin.makeBuiltins whnf, keyValueOps whnf]
+  node <- BasicNode.make hash store' makeBuiltins
   NodeServer.server 8080 node

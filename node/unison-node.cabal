@@ -65,6 +65,7 @@ library
     Unison.Runtime.ResourcePool
 
   build-depends:
+    acid-state,
     aeson,
     applicative-extras,
     attoparsec,
@@ -87,6 +88,7 @@ library
     network,
     network-simple,
     prelude-extras,
+    safecopy,
     scotty,
     sockaddr,
     stm,
@@ -119,6 +121,7 @@ executable node
     ghc-options: -funbox-strict-fields -O2
 
   build-depends:
+    acid-state,
     aeson,
     applicative-extras,
     attoparsec,
@@ -138,6 +141,7 @@ executable node
     memory,
     mtl,
     prelude-extras,
+    safecopy,
     scotty,
     stm,
     text,
