@@ -51,7 +51,10 @@ library
     Unison.NodeServer
     Unison.Reference.Extra
     Unison.Remote.Extra
+    Unison.Runtime.ExtraBuiltins
+    Unison.Runtime.KeyValueStore
     Unison.Runtime.Remote
+    Unison.Runtime.SerializationAndHashing
     Unison.Symbol.Extra
     Unison.Term.Extra
     Unison.TermEdit.Extra
@@ -88,6 +91,7 @@ library
     network,
     network-simple,
     prelude-extras,
+    random,
     safecopy,
     scotty,
     sockaddr,
@@ -141,6 +145,7 @@ executable node
     memory,
     mtl,
     prelude-extras,
+    random,
     safecopy,
     scotty,
     stm,
@@ -166,9 +171,11 @@ test-suite tests
   other-modules:
   build-depends:
     base,
+    bytestring,
     containers,
     ctrie,
     hashable,
+    random,
     stm,
     tasty,
     tasty-hunit,
@@ -176,4 +183,5 @@ test-suite tests
     tasty-quickcheck,
     time,
     transformers,
-    unison-node
+    unison-node,
+    unison-shared
