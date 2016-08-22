@@ -1,70 +1,175 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 module Unison.Runtime.Index
   (Unison.Runtime.Index.lookup
   ,Unison.Runtime.Index.delete
   ,Unison.Runtime.Index.insert
   ,Unison.Runtime.Index.lookupGT
-  ,Unison.Runtime.Index.flush
-  ,idToText
   ,load
-  ,loadEncrypted
-  ,textToId
-  ,Identifier
   ) where
 
-import Control.Concurrent.STM (STM)
+import Control.Applicative
+import Control.Monad
 import Data.ByteString (ByteString)
-import Data.Text (Text)
-import Data.Text.Encoding (decodeUtf8, encodeUtf8)
-import Unison.Cryptography
-import Unison.Runtime.Journal as J
-import Unison.Runtime.JournaledMap as JM
+import Data.Bytes.Serial (Serial)
+import Data.Maybe (catMaybes)
+import Data.Vector (Vector)
+import GHC.Generics
+import Unison.Cryptography (Cryptography)
+import qualified Data.ByteString as ByteString
+import qualified Data.Bytes.Serial as S
+import qualified Data.Vector as V
 import qualified Unison.BlockStore as BS
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Base64.URL as Base64
-import qualified Data.Map as Map
+import qualified Unison.Cryptography as C
+import qualified Unison.Runtime.Block as B
+
+data TypedSeries a = TypedSeries { series :: BS.Series, defaultValue :: a } deriving Generic
+
+data Trie = Trie { value :: TypedSeries (Maybe (Key, Value))
+                 , branches :: Vector (TypedSeries (Maybe Trie))
+                 } deriving Generic
+{-
+data IndexState h t1 t2 t3 t4 t5 t6 = IndexState
+  { blockStore :: BS.BlockStore h
+  , crypto :: Cryptography t1 t2 t3 t4 t5 t6 ByteString
+  , trie :: TypedSeries Trie
+  }
+-}
+data IndexState h t1 t2 t3 t4 t5 t6 = IndexState
+  (BS.BlockStore h)
+  (Cryptography t1 t2 t3 t4 t5 t6 ByteString)
+  (TypedSeries Trie)
+
+instance Serial BS.Series
+instance Serial a => Serial (TypedSeries a)
+instance Serial Trie where
+  serialize (Trie value branches) = S.serialize value *> S.serialize (V.toList branches)
+  deserialize = Trie <$> S.deserialize <*> fmap V.fromList S.deserialize
 
 type KeyHash = ByteString
 type Key = ByteString
 type Value = ByteString
-type Identifier = (BS.Series, BS.Series)
 
-data Db = Db (JM.JournaledMap KeyHash (Key, Value)) Identifier
+toBlock :: Serial a => Cryptography t1 t2 t3 t4 t5 t6 ByteString -> TypedSeries a -> B.Block a
+toBlock crypto ts =
+  B.serial (defaultValue ts) . B.encrypted crypto . B.fromSeries $ series ts
 
-idToText :: Identifier -> Text
-idToText (BS.Series a, BS.Series b) = decodeUtf8 $ B.concat
-  [Base64.encode a, B.cons 20 $ Base64.encode b] -- delineated by a space
+deserialize :: Serial a => BS.BlockStore h -> Cryptography t1 t2 t3 t4 t5 t6 ByteString -> TypedSeries a -> IO a
+deserialize bs crypto ts = B.get bs $ toBlock crypto ts
 
-textToId :: Text -> Identifier
-textToId t =
-  let [a, b] = B.split 20 $ encodeUtf8 t
-      decode = BS.Series . Base64.decodeLenient
-  in (decode a, decode b)
+randomSeries :: Cryptography t1 t2 t3 t4 t5 t6 ByteString -> IO BS.Series
+randomSeries crypto = BS.Series <$> C.randomBytes crypto 64
 
-load :: (Eq a) => BS.BlockStore a -> Identifier -> IO Db
-load bs (cp, ud) = do
-  jm <- JM.fromSeries bs cp ud
-  pure $ Db jm (cp, ud)
+emptyTT :: Eq a => BS.BlockStore a -> Cryptography t1 t2 t3 t4 t5 t6 ByteString
+  -> IO (TypedSeries Trie)
+emptyTT bs crypto = do
+  rootSeries@(BS.Series bytes) <- randomSeries crypto
+  serieses <- replicateM 256 $ randomSeries crypto
+  h0 <- BS.declareSeries bs rootSeries
+  let
+    valueSeries = TypedSeries (BS.Series $ bytes `mappend` "values") Nothing
+    blocks :: [TypedSeries (Maybe Trie)]
+    blocks = map (`TypedSeries` Nothing) serieses
+    node = Trie valueSeries . V.fromList $ blocks
+    typedSeries = TypedSeries rootSeries node
+    block = toBlock crypto typedSeries
+  _ <- B.tryUpdate bs block h0 node
+  pure typedSeries
 
-loadEncrypted :: (Eq a) => BS.BlockStore a -> Cryptography t1 t2 t3 t4 t5 t6 ByteString
-  -> Identifier -> IO Db
-loadEncrypted bs crypto (cp, ud) = do
-  jm <- JM.fromEncryptedSeries crypto bs cp ud
-  pure $ Db jm (cp, ud)
+isEmpty :: BS.BlockStore a -> Cryptography t1 t2 t3 t4 t5 t6 ByteString -> Trie -> IO Bool
+isEmpty bs crypto trie = do
+  dBranches <- mapM (deserialize bs crypto) . V.toList $ branches trie
+  pure . null. catMaybes $ dBranches
 
-flush :: Db -> IO ()
-flush (Db journaledMap _) = J.record journaledMap
+load :: Eq a => BS.BlockStore a -> Cryptography t1 t2 t3 t4 t5 t6 ByteString -> BS.Series
+  -> IO (IndexState a t1 t2 t3 t4 t5 t6)
+load bs crypto series = do
+  let block = B.fromSeries series
+      blockTyped = B.serialM (emptyTT bs crypto) block
+  trie <- B.get bs blockTyped
+  pure $ IndexState bs crypto trie
 
-insert :: KeyHash -> (Key, Value) -> Db -> STM (STM ())
-insert kh kv (Db journaledMap _) = J.updateNowAsyncFlush (JM.Insert kh kv) journaledMap
+insert :: Eq a => IndexState a t1 t2 t3 t4 t5 t6 -> KeyHash -> (Key, Value) -> IO ()
+insert (IndexState bs crypto trie) kh (k,v) = do
+  trie <- deserialize bs crypto trie
+  insert' trie kh
+  where
+    insert' trie kh = case ByteString.uncons kh of
+      Nothing -> let block = toBlock crypto $ value trie
+                in void (B.modify' bs block $ const (Just (k,v)))
+      Just (branchKey, kh) -> do
+        let typedSeries = branches trie V.! fromIntegral branchKey
+        branch <- deserialize bs crypto typedSeries
+        case branch of
+          Nothing -> do
+            newBranch <- deserialize bs crypto =<< emptyTT bs crypto
+            _ <- B.modify' bs (toBlock crypto typedSeries) (const $ Just newBranch)
+            insert' newBranch kh
+          Just branch -> insert' branch kh
 
-delete :: KeyHash -> Db -> STM (STM ())
-delete kh (Db journaledMap _) = J.updateNowAsyncFlush (JM.Delete kh) journaledMap
+delete :: Eq a => IndexState a t1 t2 t3 t4 t5 t6 -> KeyHash -> IO ()
+delete (IndexState bs crypto trie) k = do
+  Trie v0 branches <- deserialize bs crypto trie
+  case ByteString.uncons k of
+    Nothing -> void (B.modify' bs (toBlock crypto v0) $ const Nothing)
+    Just (branchKey, k) -> delete' (branches V.! fromIntegral branchKey) k
+  where
+    delete' trie k = do
+      trieDeserialized <- deserialize bs crypto trie
+      case (ByteString.uncons k, trieDeserialized) of
+        (Nothing, Just (Trie v0 _)) -> void (B.modify' bs (toBlock crypto v0) $ const Nothing)
+        (Just (branchKey, k), Just trie2@(Trie _ branches)) -> do
+          delete' (branches V.! fromIntegral branchKey) k
+          -- calculating if the tree is empty is expensive.
+          -- TODO if it fails, earlier calls in the recursion stack should automatically fail
+          emptyTree <- isEmpty bs crypto trie2
+          when emptyTree $ BS.deleteSeries bs (series trie)
+        _ -> pure () -- key didn't actually exist in this index
 
-lookup :: KeyHash -> Db -> STM (Maybe (Key, Value))
-lookup kh (Db journaledMap _) = Map.lookup kh <$> J.get journaledMap
+lookup :: Eq a => IndexState a t1 t2 t3 t4 t5 t6 -> KeyHash -> IO (Maybe (Key,Value))
+lookup (IndexState bs crypto trie) k = do
+  trie <- deserialize bs crypto trie
+  lookup' trie k
+  where
+    lookup' (Trie v0 branches) k = case ByteString.uncons k of
+      Nothing -> let block = toBlock crypto v0
+                 in B.get bs block
+      Just (branchKey, k) -> do
+        let typedSeries = branches V.! fromIntegral branchKey
+        branch <- deserialize bs crypto typedSeries
+        case branch of
+          Nothing -> pure Nothing
+          Just branch -> lookup' branch k
 
--- | Find next key in the Db whose key is greater than the provided key
-lookupGT :: KeyHash -> Db -> STM (Maybe (KeyHash, (Key, Value)))
-lookupGT kh (Db journaledMap _) = Map.lookupGT kh <$> J.get journaledMap
+lookupGTE :: Eq a => IndexState a t1 t2 t3 t4 t5 t6 -> KeyHash -> IO (Maybe (KeyHash, (Key, Value)))
+lookupGTE (IndexState bs crypto trie) k = do
+  trie <- deserialize bs crypto trie
+  lookupGT' trie k ByteString.empty
+  where
+    lookupGT' (Trie v0 branches) k kcons = case ByteString.uncons k of
+      Nothing -> let block = toBlock crypto v0 in do
+                 --in (\kv -> Just (kcons, kv)) <$> B.get bs block
+        result <- B.get bs block
+        pure $ case result of
+          Nothing -> Nothing
+          Just result -> Just (kcons, result)
+      Just (branchKey, k) -> do
+        let makeOption i = do
+              branch <- deserialize bs crypto $ branches V.! fromIntegral i
+              -- TODO remove case statement for something more succinct
+              case branch of
+                Nothing -> pure Nothing
+                Just branch -> lookupGT' branch k $ ByteString.snoc kcons i
+        foldM (\m i -> liftM2 (<|>) (pure m) (makeOption i)) Nothing
+          [branchKey..255]
+
+succB :: ByteString -> ByteString
+succB b = case ByteString.unsnoc b of
+  Nothing -> ByteString.singleton 0
+  Just (init, last) -> uncurry ByteString.snoc $
+    if last == 255 then (succB init, 0) else (init, last + 1)
+
+lookupGT :: Eq a => IndexState a t1 t2 t3 t4 t5 t6 -> KeyHash -> IO (Maybe (KeyHash, (Key, Value)))
+lookupGT indexState k = lookupGTE indexState $ succB k
 

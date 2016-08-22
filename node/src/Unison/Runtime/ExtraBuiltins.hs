@@ -6,10 +6,13 @@ module Unison.Runtime.ExtraBuiltins where
 import Control.Exception (finally)
 import Control.Concurrent.STM (atomically)
 import Data.ByteString (ByteString)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Unison.BlockStore (Series(..), BlockStore)
 import Unison.Node.Builtin
 import Unison.Parsers (unsafeParseType)
 import Unison.Type (Type)
+import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Base64.URL as Base64
 import qualified Data.Text as Text
 import qualified Data.Vector as Vector
 import qualified Unison.Cryptography as C
@@ -54,17 +57,16 @@ pattern Link' href description <-
 makeAPI :: Eq a => BlockStore a -> C.Cryptography k syk sk skp s h ByteString
   -> IO (WHNFEval -> [Builtin])
 makeAPI blockStore crypto = do
-  let nextID = do
-        cp <- C.randomBytes crypto 64
-        ud <- C.randomBytes crypto 64
-        pure (Series cp, Series ud)
-  resourcePool <- RP.make 3 10 (Index.loadEncrypted blockStore crypto) Index.flush
+  let nextID = Series <$> C.randomBytes crypto 64
+      idToText (Series bs) = decodeUtf8 $ Base64.encode bs
+      textToId = Series . Base64.decodeLenient . encodeUtf8
+  resourcePool <- RP.make 3 10 (Index.load blockStore crypto) (const (pure ()))
   pure (\whnf -> map (\(r, o, t, m) -> Builtin r o t m)
      [ let r = R.Builtin "Index.unsafeEmpty"
            op [self] = do
              ident <- Note.lift nextID
              Term.Distributed' (Term.Node self) <- whnf self
-             pure . index self . Term.lit . Term.Text . Index.idToText $ ident
+             pure . index self . Term.lit . Term.Text . idToText $ ident
            op _ = fail "Index.unsafeEmpty unpossible"
            type' = unsafeParseType "forall k v. Node -> Index k v"
        in (r, Just (I.Primop 1 op), type', prefix "unsafeEmpty")
@@ -76,13 +78,13 @@ makeAPI blockStore crypto = do
                g i k
              g (Term.Text' h) k = do
                val <- Note.lift $ do
-                 (db, cleanup) <- RP.acquire resourcePool . Index.textToId $ h
+                 (db, cleanup) <- RP.acquire resourcePool . textToId $ h
                  flip finally cleanup $ do
-                   result <- atomically $ Index.lookup (SAH.hash' k) db
-                   case result >>= (pure . SAH.deserializeTermFromBytes . snd) of
-                     Just (Left s) -> fail ("Index.unsafeLookup could not deserialize: " ++ s)
-                     Just (Right t) -> pure $ some t
-                     Nothing -> pure none
+                  result <- Index.lookup db $ SAH.hash' k
+                  case result >>= (pure . SAH.deserializeTermFromBytes . snd) of
+                    Just (Left s) -> fail ("Index.unsafeLookup could not deserialize: " ++ s)
+                    Just (Right t) -> pure $ some t
+                    Nothing -> pure none
                pure val
              g s k = pure $ Term.ref r `Term.app` s `Term.app` k
            op _ = fail "Index.unsafeLookup unpossible"
@@ -108,10 +110,9 @@ makeAPI blockStore crypto = do
                g k' v' s
              g k v (Term.Text' h) = do
                Note.lift $ do
-                 (db, cleanup) <- RP.acquire resourcePool . Index.textToId $ h
-                 flip finally cleanup $ atomically
-                   (Index.insert (SAH.hash' k) (SAH.serializeTerm k, SAH.serializeTerm v) db)
-                   >>= atomically
+                 (db, cleanup) <- RP.acquire resourcePool . textToId $ h
+                 flip finally cleanup $
+                   Index.insert db (SAH.hash' k) (SAH.serializeTerm k, SAH.serializeTerm v)
                pure unitRef
              g k v index = pure $ Term.ref r `Term.app` k `Term.app` v `Term.app` index
            op _ = fail "Index.unsafeInsert unpossible"
