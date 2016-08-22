@@ -29,13 +29,7 @@ data TypedSeries a = TypedSeries { series :: BS.Series, defaultValue :: a } deri
 data Trie = Trie { value :: TypedSeries (Maybe (Key, Value))
                  , branches :: Vector (TypedSeries (Maybe Trie))
                  } deriving Generic
-{-
-data IndexState h t1 t2 t3 t4 t5 t6 = IndexState
-  { blockStore :: BS.BlockStore h
-  , crypto :: Cryptography t1 t2 t3 t4 t5 t6 ByteString
-  , trie :: TypedSeries Trie
-  }
--}
+
 data IndexState h t1 t2 t3 t4 t5 t6 = IndexState
   (BS.BlockStore h)
   (Cryptography t1 t2 t3 t4 t5 t6 ByteString)
@@ -88,6 +82,7 @@ load bs crypto series = do
   let block = B.fromSeries series
       blockTyped = B.serialM (emptyTT bs crypto) block
   trie <- B.get bs blockTyped
+  _ <- B.modify' bs blockTyped (const trie)
   pure $ IndexState bs crypto trie
 
 insert :: Eq a => IndexState a t1 t2 t3 t4 t5 t6 -> KeyHash -> (Key, Value) -> IO ()

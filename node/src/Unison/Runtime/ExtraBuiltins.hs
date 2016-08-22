@@ -4,14 +4,12 @@
 module Unison.Runtime.ExtraBuiltins where
 
 import Control.Exception (finally)
-import Control.Concurrent.STM (atomically)
 import Data.ByteString (ByteString)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Unison.BlockStore (Series(..), BlockStore)
 import Unison.Node.Builtin
 import Unison.Parsers (unsafeParseType)
 import Unison.Type (Type)
-import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Base64.URL as Base64
 import qualified Data.Text as Text
 import qualified Data.Vector as Vector
